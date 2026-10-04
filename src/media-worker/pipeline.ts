@@ -273,6 +273,11 @@ export class MediaProcessingPipeline {
     return job;
   }
 
+  /** Whether yt-dlp works here, i.e. TikTok/Instagram/YouTube videos can be downloaded. */
+  canDownloadVideos(): Promise<boolean> {
+    return this.ytdlp.isAvailable();
+  }
+
   getJob(sourceId: string): SourceJob | undefined {
     return this.jobs.get(sourceId);
   }

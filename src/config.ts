@@ -55,7 +55,8 @@ export function loadConfig(): AppConfig {
     extractionModel: optional('OPENAI_EXTRACTION_MODEL', 'gpt-4o-mini'),
     maxUploadBytes: Number(optional('MAX_UPLOAD_MB', '200')) * 1024 * 1024,
     maxFrames: Number(optional('MAX_FRAMES', '12')),
-    pipelineVersion: 'pipeline-2026.10.1',
+    // Bump with each deploy-worthy change: /health reports it, so a redeploy can be confirmed.
+    pipelineVersion: 'pipeline-2026.10.4',
     promptVersion: 'extract-v1',
   };
 }

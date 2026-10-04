@@ -48,12 +48,16 @@ const badRequest = (res: express.Response, error: z.ZodError | string) =>
   res.status(400).json({ error: typeof error === 'string' ? error : error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ') });
 
 // Health Check
-app.get('/health', (req, res) => {
+app.get('/health', async (req, res) => {
   res.json({
     status: 'ok',
     service: 'Vibi API',
     pipelineVersion: config.pipelineVersion,
-    capabilities: { placeMedia: placeMedia.isConfigured }
+    capabilities: {
+      placeMedia: placeMedia.isConfigured,
+      placeSearch: placeLookup.isConfigured,
+      videoDownload: await pipeline.canDownloadVideos()
+    }
   });
 });
 
