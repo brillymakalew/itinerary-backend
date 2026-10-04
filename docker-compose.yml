@@ -1,0 +1,27 @@
+# Vibi API. On the server, next to a filled-in .env: docker compose up -d --build
+name: vibi
+
+services:
+  api:
+    build: .
+    image: vibi-api
+    container_name: vibi-api
+    restart: unless-stopped
+    # Forwards stop signals to Node so `docker compose down` exits promptly.
+    init: true
+    env_file: .env
+    environment:
+      PORT: "3030"
+      DATA_DIR: /app/data
+    ports:
+      - "3030:3030"
+    volumes:
+      - vibi-data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  vibi-data:

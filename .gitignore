@@ -1,0 +1,16 @@
+# Secrets: real keys and the API token live only in .env (copy it to the server separately)
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules/
+dist/
+coverage/
+
+# Runtime data (uploads)
+data/
+
+*.log
+.DS_Store
+Thumbs.db
