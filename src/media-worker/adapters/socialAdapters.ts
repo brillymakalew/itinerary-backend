@@ -1,7 +1,9 @@
 // Social Media Ingestion Adapters (PRD §6.1, §9.3 Stage 1 & 2)
 
+export type SourcePlatform = 'tiktok' | 'instagram' | 'youtube' | 'google_maps' | 'other_url';
+
 export interface SocialMetadata {
-  platform: 'tiktok' | 'instagram' | 'other_url';
+  platform: SourcePlatform;
   originalUrl: string;
   normalizedUrl: string;
   title?: string;
@@ -14,95 +16,133 @@ export interface SocialMetadata {
   hasMetadata?: boolean;
 }
 
+/**
+ * Caption details the app read on the phone. Servers in data centres are often refused by TikTok,
+ * while phones on ordinary networks are not, so the app sends what it saw along with the link.
+ */
+export interface ClientPreview {
+  title?: string;
+  description?: string;
+  authorName?: string;
+  thumbnailUrl?: string;
+}
+
+/** Query parameters that only track the share and never change which post is meant. */
+const TRACKING_PARAMS = [
+  'utm_source', 'utm_medium', 'utm_campaign', 'utm_content', 'utm_term',
+  'igsh', 'igshid', 'is_from_webapp', 'sender_device', 'sender_web_id', 't', '_r', '_t',
+  'si', 'feature', 'pp', 'g_st', 'entry'
+];
+
+/** oEmbed answers HTTP 503 "overload-protect" to a share of requests at random; retrying works. */
+const OEMBED_ATTEMPTS = 4;
+const OEMBED_RETRY_DELAYS_MS = [350, 900, 1800];
+
+const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+function isPrivateHost(hostname: string): boolean {
+  return (
+    hostname === 'localhost' ||
+    hostname.startsWith('127.') ||
+    hostname.startsWith('10.') ||
+    hostname.startsWith('192.168.') ||
+    hostname.startsWith('169.254.') ||
+    /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
+    hostname === '[::1]' ||
+    hostname === '0.0.0.0'
+  );
+}
+
+/** google.com, google.co.id, google.com.vn, … */
+export function isGoogleHost(hostname: string): boolean {
+  return /(^|\.)google\.[a-z]{2,3}(\.[a-z]{2})?$/.test(hostname);
+}
+
+export function detectPlatform(url: URL): SourcePlatform {
+  const host = url.hostname.toLowerCase().replace(/^www\./, '');
+  const path = url.pathname.toLowerCase();
+  if (host === 'tiktok.com' || host.endsWith('.tiktok.com')) return 'tiktok';
+  if (host === 'instagram.com' || host.endsWith('.instagram.com')) return 'instagram';
+  if (host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com')) return 'youtube';
+  if (
+    host === 'maps.app.goo.gl' ||
+    (host === 'goo.gl' && path.startsWith('/maps')) ||
+    host === 'g.page' ||
+    host.startsWith('maps.google.') ||
+    (isGoogleHost(host) && path.startsWith('/maps'))
+  ) {
+    return 'google_maps';
+  }
+  return 'other_url';
+}
+
 export class SocialAdapters {
+  /** Metadata from the app's preview, or null when it carries no caption text to analyze. */
+  static fromClientPreview(url: string, platform: SourcePlatform, preview?: ClientPreview): SocialMetadata | null {
+    const title = preview?.title?.trim() || undefined;
+    const caption = preview?.description?.trim() || title;
+    if (!caption) return null;
+    return {
+      platform,
+      originalUrl: url,
+      normalizedUrl: this.normalizeUrl(url).normalizedUrl,
+      title,
+      caption,
+      authorName: preview?.authorName?.trim() || undefined,
+      thumbnailUrl: preview?.thumbnailUrl?.startsWith('https://') ? preview.thumbnailUrl : undefined,
+      hasAnalyzableMedia: false,
+      hasMetadata: true
+    };
+  }
+
   /**
    * Stage 1: URL Normalization & SSRF Protection
    */
-  static normalizeUrl(rawUrl: string): { normalizedUrl: string; platform: SocialMetadata['platform'] } {
+  static normalizeUrl(rawUrl: string): { normalizedUrl: string; platform: SourcePlatform } {
     let cleanUrl = rawUrl.trim();
     // Extract first URL if text contains surrounding share text
-    const urlMatch = cleanUrl.match(/https?:\/\/[^\s]+/);
+    const urlMatch = cleanUrl.match(/https?:\/\/[^\s<>"']+/);
     if (urlMatch) {
-      cleanUrl = urlMatch[0];
+      cleanUrl = urlMatch[0].replace(/[.,)!?]+$/, '');
     }
 
     try {
       const parsed = new URL(cleanUrl);
-      // SSRF security check: forbid private/loopback IP addresses
-      const hostname = parsed.hostname.toLowerCase();
-      if (
-        hostname === 'localhost' ||
-        hostname.startsWith('127.') ||
-        hostname.startsWith('10.') ||
-        hostname.startsWith('192.168.') ||
-        hostname.startsWith('169.254.') ||
-        /^172\.(1[6-9]|2\d|3[01])\./.test(hostname) ||
-        hostname === '[::1]' ||
-        hostname === '0.0.0.0'
-      ) {
+      if (isPrivateHost(parsed.hostname.toLowerCase())) {
         throw new Error('Disallowed hostname for security');
       }
-
-      // Strip tracking query parameters
-      const trackingParams = ['utm_source', 'utm_medium', 'utm_campaign', 'igsh', 'is_from_webapp', 'sender_device', 't'];
-      for (const p of trackingParams) {
-        parsed.searchParams.delete(p);
+      const platform = detectPlatform(parsed);
+      // Google Maps links carry the place in their parameters; leave them untouched.
+      if (platform !== 'google_maps') {
+        for (const p of TRACKING_PARAMS) parsed.searchParams.delete(p);
       }
-
-      let platform: SocialMetadata['platform'] = 'other_url';
-      if (hostname.includes('tiktok.com')) {
-        platform = 'tiktok';
-      } else if (hostname.includes('instagram.com')) {
-        platform = 'instagram';
-      }
-
-      return {
-        normalizedUrl: parsed.toString(),
-        platform
-      };
+      return { normalizedUrl: parsed.toString(), platform };
     } catch {
-      return {
-        normalizedUrl: cleanUrl,
-        platform: 'other_url'
-      };
+      return { normalizedUrl: cleanUrl, platform: 'other_url' };
     }
   }
 
   /**
-   * Stage 2: Official Metadata Retrieval (TikTok oEmbed & Instagram metadata)
+   * Stage 2: Official Metadata Retrieval (TikTok oEmbed & Open Graph tags)
    */
-  static async fetchMetadata(url: string, platform: SocialMetadata['platform']): Promise<SocialMetadata> {
+  static async fetchMetadata(url: string, platform: SourcePlatform): Promise<SocialMetadata> {
     const { normalizedUrl } = this.normalizeUrl(url);
 
     if (platform === 'tiktok') {
-      try {
-        const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(normalizedUrl)}`;
-        const res = await fetch(oembedUrl, {
-          headers: { 'User-Agent': 'Vibi-Travel-App/1.0' },
-          signal: AbortSignal.timeout(6000)
-        });
-        if (res.ok) {
-          const data = (await res.json()) as {
-            title?: string;
-            author_name?: string;
-            thumbnail_url?: string;
-            html?: string;
-          };
-          return {
-            platform: 'tiktok',
-            originalUrl: url,
-            normalizedUrl,
-            title: data.title,
-            caption: data.title,
-            authorName: data.author_name,
-            thumbnailUrl: data.thumbnail_url,
-            html: data.html,
-            hasAnalyzableMedia: false, // oEmbed delivers caption and thumbnail, not full raw MP4
-            hasMetadata: Boolean(data.title || data.thumbnail_url)
-          };
-        }
-      } catch (err) {
-        console.warn(`[TikTok oEmbed] Fallback for ${url}:`, err);
+      const oembed = await this.fetchTikTokOEmbed(normalizedUrl);
+      if (oembed) {
+        return {
+          platform: 'tiktok',
+          originalUrl: url,
+          normalizedUrl,
+          title: oembed.title,
+          caption: oembed.title,
+          authorName: oembed.author_name,
+          thumbnailUrl: oembed.thumbnail_url,
+          html: oembed.html,
+          hasAnalyzableMedia: false, // oEmbed delivers caption and thumbnail, not full raw MP4
+          hasMetadata: Boolean(oembed.title || oembed.thumbnail_url)
+        };
       }
     }
 
@@ -116,6 +156,7 @@ export class SocialAdapters {
           },
           signal: AbortSignal.timeout(6000)
         });
+        if (!res.ok) console.warn(`[Page metadata] HTTP ${res.status} for ${normalizedUrl}`);
         if (res.ok && (res.headers.get('content-type') ?? '').includes('text/html')) {
           const html = (await res.text()).slice(0, 500_000);
           const meta = (property: string) =>
@@ -151,10 +192,37 @@ export class SocialAdapters {
       hasMetadata: false
     };
   }
+
+  private static async fetchTikTokOEmbed(normalizedUrl: string): Promise<{
+    title?: string;
+    author_name?: string;
+    thumbnail_url?: string;
+    html?: string;
+  } | null> {
+    const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(normalizedUrl)}`;
+    for (let attempt = 1; attempt <= OEMBED_ATTEMPTS; attempt++) {
+      try {
+        const res = await fetch(oembedUrl, {
+          headers: { 'User-Agent': 'Vibi-Travel-App/1.0' },
+          signal: AbortSignal.timeout(6000)
+        });
+        if (res.ok) return (await res.json()) as any;
+        const body = (await res.text()).slice(0, 160);
+        // 400/404 mean the post itself is unavailable; only overload and rate limits are worth a retry.
+        const retryable = res.status === 429 || res.status >= 500;
+        console.warn(`[TikTok oEmbed] HTTP ${res.status} for ${normalizedUrl} (attempt ${attempt}): ${body}`);
+        if (!retryable) return null;
+      } catch (err: any) {
+        console.warn(`[TikTok oEmbed] attempt ${attempt} failed for ${normalizedUrl}:`, err?.message ?? err);
+      }
+      if (attempt < OEMBED_ATTEMPTS) await sleep(OEMBED_RETRY_DELAYS_MS[attempt - 1] ?? 1800);
+    }
+    return null;
+  }
 }
 
 /** Meta tag content arrives HTML-escaped (e.g. `&amp;`, `&#39;`, `&#x1F35C;`). */
-function decodeEntities(text: string): string {
+export function decodeEntities(text: string): string {
   return text
     .replace(/&#(\d+);/g, (_, code) => String.fromCodePoint(Number(code)))
     .replace(/&#x([0-9a-f]+);/gi, (_, code) => String.fromCodePoint(parseInt(code, 16)))

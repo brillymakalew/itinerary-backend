@@ -12,6 +12,8 @@ export interface ResolvedCandidate {
   resolutionConfidence: number;
   confidenceBand: 'HIGH' | 'CHECK' | 'LOW';
   reviewState: 'PENDING' | 'SAVED' | 'MAYBE' | 'SKIPPED' | 'WRONG_PLACE';
+  /** Practical advice the source gives about the place, shown as a tip once it's saved. */
+  tip?: string;
   evidence: {
     type: string;
     text?: string;
@@ -28,6 +30,8 @@ export interface ResolvedCandidate {
     rating?: number;
     priceLevel?: number;
     category: string;
+    /** Google place types, e.g. ["locality", "political"] for a whole city. */
+    types?: string[];
   };
   options: {
     providerPlaceId: string;
@@ -48,9 +52,13 @@ export class GooglePlacesResolver {
   /**
    * Resolve an extracted candidate against Google Places API (PRD §9.3 Stage 7)
    */
-  async resolve(candidate: ExtractedPlace, sourceId: string): Promise<ResolvedCandidate> {
+  async resolve(candidate: ExtractedPlace, sourceId: string, destination = 'Hanoi, Vietnam'): Promise<ResolvedCandidate> {
     const candidateId = `cand_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const query = `${candidate.raw_name} ${candidate.city_or_area_hint || 'Hanoi'} Vietnam`;
+    // The area the source mentions is the best hint; otherwise search around the trip destination.
+    const area = candidate.city_or_area_hint
+      ? `${candidate.city_or_area_hint} ${candidate.country_hint || ''}`.trim()
+      : destination;
+    const query = `${candidate.raw_name} ${area}`;
 
     let providerMatches: any[] = [];
 
@@ -140,6 +148,7 @@ export class GooglePlacesResolver {
       resolutionConfidence: topConfidence,
       confidenceBand: band,
       reviewState: 'PENDING',
+      tip: candidate.tip || undefined,
       evidence: formattedEvidence,
       topMatch: topMatch
         ? {
@@ -149,7 +158,8 @@ export class GooglePlacesResolver {
             location: topMatch.location,
             rating: topMatch.rating,
             priceLevel: topMatch.priceLevel,
-            category: this.mapCategory(candidate.place_type)
+            category: this.mapCategory(candidate.place_type),
+            types: topMatch.types
           }
         : undefined,
       options: scoredOptions
@@ -184,7 +194,8 @@ export class GooglePlacesResolver {
   private mapCategory(rawType: string): string {
     const t = rawType.toUpperCase();
     if (t.includes('CAFE') || t.includes('COFFEE')) return 'CAFE';
-    if (t.includes('REST') || t.includes('FOOD') || t.includes('MEAL')) return 'FOOD';
+    if (t.includes('REST') || t.includes('FOOD') || t.includes('MEAL') || t.includes('BAR')) return 'FOOD';
+    if (t === 'AREA') return 'AREA';
     if (t.includes('MARKET')) return 'MARKET';
     if (t.includes('VIEW') || t.includes('PHOTO')) return 'VIEWPOINT';
     if (t.includes('HOTEL') || t.includes('STAY')) return 'HOTEL';

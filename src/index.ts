@@ -7,8 +7,9 @@ import fs from 'fs';
 import { z } from 'zod';
 import { loadConfig } from './config';
 import { ItinerarySolver, SolverInput } from './itinerary/solver';
-import { MediaProcessingPipeline } from './media-worker/pipeline';
+import { MediaProcessingPipeline, publicJob } from './media-worker/pipeline';
 import { PHOTO_NAME_PATTERN, PlaceMediaService } from './places/placeMediaService';
+import { PlaceLookupError, PlaceLookupService } from './places/placeLookup';
 import { requireApiToken } from './auth';
 
 const config = loadConfig();
@@ -21,7 +22,8 @@ if (config.apiToken) app.use('/api', requireApiToken(config.apiToken));
 app.use(express.json({ limit: '1mb' }));
 
 const solver = new ItinerarySolver();
-const pipeline = new MediaProcessingPipeline(config);
+const placeLookup = new PlaceLookupService(config.googleApiKey);
+const pipeline = new MediaProcessingPipeline(config, undefined, placeLookup);
 const placeMedia = new PlaceMediaService(config.googleApiKey);
 
 // Multer upload config for video/screenshot fallbacks (PRD §9.2)
@@ -59,17 +61,45 @@ app.get('/health', (req, res) => {
 const ImportRequest = z.object({
   trip_id: z.string().min(1),
   url: z.string().min(1).max(2048),
-  force: z.boolean().optional()
+  force: z.boolean().optional(),
+  // Caption details the app read on the phone (see SocialAdapters.fromClientPreview).
+  preview: z.object({
+    title: z.string().max(4000).optional(),
+    description: z.string().max(8000).optional(),
+    author_name: z.string().max(200).optional(),
+    thumbnail_url: z.string().url().max(2048).optional()
+  }).optional(),
+  // Who added it, so both phones can show "Added by Dian".
+  created_by: z.string().max(100).optional(),
+  created_by_name: z.string().max(100).optional(),
+  // The trip's destination ("Hanoi and Sapa, Vietnam"); place names are matched near it.
+  destination: z.string().max(200).optional(),
+  // Set when retrying an import; lets an uploaded video be found again after a server restart.
+  source_id: z.string().max(100).optional()
 });
 
 app.post('/api/sources/import', (req, res) => {
   const parsed = ImportRequest.safeParse(req.body);
   if (!parsed.success) return badRequest(res, 'Missing trip_id or url');
-  const { trip_id, url, force } = parsed.data;
-  if (!/https?:\/\/\S+/i.test(url)) return badRequest(res, 'Paste a TikTok, Instagram or web link (it should start with https://).');
+  const { trip_id, url, force, preview, created_by, created_by_name, destination, source_id } = parsed.data;
+  if (!/https?:\/\/\S+/i.test(url) && !url.startsWith('upload://')) {
+    return badRequest(res, 'Paste a TikTok, Instagram, YouTube or Google Maps link (it should start with https://).');
+  }
 
   try {
-    const job = pipeline.startImportJob(trip_id, url, force ?? false);
+    const job = pipeline.startImportJob(trip_id, url, {
+      force: force ?? false,
+      preview: preview && {
+        title: preview.title,
+        description: preview.description,
+        authorName: preview.author_name,
+        thumbnailUrl: preview.thumbnail_url
+      },
+      createdBy: created_by,
+      createdByName: created_by_name,
+      destination,
+      sourceId: source_id
+    });
     return res.status(202).json({
       source_id: job.sourceId,
       trip_id: job.tripId,
@@ -80,7 +110,8 @@ app.post('/api/sources/import', (req, res) => {
     });
   } catch (err: any) {
     console.error('Import error:', err);
-    return res.status(500).json({ error: err.message || 'Import failed' });
+    const gone = /no longer on the server/i.test(err?.message ?? '');
+    return res.status(gone ? 410 : 500).json({ error: err.message || 'Import failed' });
   }
 });
 
@@ -90,12 +121,12 @@ app.get('/api/sources/:id', (req, res) => {
   if (!job) {
     return res.status(404).json({ error: 'Source not found' });
   }
-  return res.json(job);
+  return res.json(publicJob(job));
 });
 
 // GET /api/trips/:tripId/sources (Get all inbox sources for a trip)
 app.get('/api/trips/:tripId/sources', (req, res) => {
-  return res.json(pipeline.getJobsForTrip(req.params.tripId));
+  return res.json(pipeline.getJobsForTrip(req.params.tripId).map(publicJob));
 });
 
 // 18.2 POST /api/sources/:id/upload-fallback — analysis continues in the background.
@@ -107,9 +138,17 @@ app.post('/api/sources/:id/upload-fallback', upload.single('media'), (req, res) 
     return badRequest(res, 'Missing media file upload');
   }
 
+  const field = (name: string) => {
+    const value = req.body?.[name];
+    return typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined;
+  };
   try {
-    const job = pipeline.startMediaUpload(id, tripId, req.file.path, req.file.originalname);
-    return res.status(202).json(job);
+    const job = pipeline.startMediaUpload(id, tripId, req.file.path, req.file.originalname, {
+      createdBy: field('created_by'),
+      createdByName: field('created_by_name'),
+      destination: field('destination')
+    });
+    return res.status(202).json(publicJob(job));
   } catch (err: any) {
     fs.promises.unlink(req.file.path).catch(() => {});
     return res.status(500).json({ error: err.message || 'Media processing failed' });
@@ -127,32 +166,57 @@ app.post('/api/candidates/:id/review', (req, res) => {
   return res.json({ success: updated, candidate_id: id, state });
 });
 
-// GET /api/places/search (Manual place search biased to trip city)
-app.get('/api/places/search', async (req, res) => {
-  const q = req.query.q as string;
-  const city = (req.query.city as string) || 'Hanoi';
-  if (!q) {
-    return badRequest(res, 'Missing search query q');
-  }
+// GET /api/places/search — find a place by name to add it (Plan → Add a stop, Saves → Add).
+const SearchQuery = z.object({
+  q: z.string().trim().min(1).max(200),
+  city: z.string().max(100).optional(),
+  lat: z.coerce.number().min(-90).max(90).optional(),
+  lng: z.coerce.number().min(-180).max(180).optional()
+});
 
-  const query = `${q} ${city} Vietnam`;
+app.get('/api/places/search', async (req, res) => {
+  const parsed = SearchQuery.safeParse(req.query);
+  if (!parsed.success) return badRequest(res, 'Missing search query q');
+  const { q, city, lat, lng } = parsed.data;
+  const near = lat !== undefined && lng !== undefined ? { latitude: lat, longitude: lng } : undefined;
   try {
-    const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${config.googleApiKey}`;
-    const response = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    const data = (await response.json()) as any;
-    const places = (data.results || []).slice(0, 10).map((r: any) => ({
-      providerPlaceId: r.place_id,
-      name: r.name,
-      address: r.formatted_address,
-      latitude: r.geometry?.location?.lat,
-      longitude: r.geometry?.location?.lng,
-      rating: r.rating,
-      priceLevel: r.price_level,
-      types: r.types || []
-    }));
-    return res.json({ results: places });
+    // Without coordinates the city in the text keeps results in the right country.
+    const places = await placeLookup.search(near || !city ? q : `${q} ${city}`, near);
+    return res.json({
+      results: places.map(p => ({
+        providerPlaceId: p.providerPlaceId,
+        name: p.name,
+        address: p.address,
+        latitude: p.location.latitude,
+        longitude: p.location.longitude,
+        rating: p.rating,
+        userRatingCount: p.userRatingCount,
+        priceLevel: p.priceLevel,
+        types: p.types,
+        category: p.category,
+        googleMapsUri: p.googleMapsUri
+      }))
+    });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'Places search failed' });
+    if (err instanceof PlaceLookupError) return res.status(err.status).json({ error: err.message });
+    console.warn('[Places] search failed:', err.message);
+    return res.status(502).json({ error: 'Google Maps search is unavailable right now.' });
+  }
+});
+
+// POST /api/places/resolve-link — the place behind a Google Maps link or share text.
+const ResolveLinkRequest = z.object({ text: z.string().trim().min(1).max(4000) });
+
+app.post('/api/places/resolve-link', async (req, res) => {
+  const parsed = ResolveLinkRequest.safeParse(req.body);
+  if (!parsed.success) return badRequest(res, 'Paste a Google Maps link.');
+  try {
+    const place = await placeLookup.resolveMapsLink(parsed.data.text);
+    return res.json({ place });
+  } catch (err: any) {
+    if (err instanceof PlaceLookupError) return res.status(err.status).json({ error: err.message });
+    console.warn('[Places] link lookup failed:', err.message);
+    return res.status(502).json({ error: 'Couldn’t open that Google Maps link right now. Try again.' });
   }
 });
 
