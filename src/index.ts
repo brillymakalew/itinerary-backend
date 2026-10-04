@@ -19,7 +19,8 @@ const port = config.port;
 app.use(cors());
 // Checked before any body parsing or upload handling; /health stays open for uptime checks.
 if (config.apiToken) app.use('/api', requireApiToken(config.apiToken));
-app.use(express.json({ limit: '1mb' }));
+// Room for a YouTube transcript the phone sends along (a two-hour video is ~500 KB).
+app.use(express.json({ limit: '3mb' }));
 
 const solver = new ItinerarySolver();
 const placeLookup = new PlaceLookupService(config.googleApiKey);
@@ -71,7 +72,9 @@ const ImportRequest = z.object({
     title: z.string().max(4000).optional(),
     description: z.string().max(8000).optional(),
     author_name: z.string().max(200).optional(),
-    thumbnail_url: z.string().url().max(2048).optional()
+    thumbnail_url: z.string().url().max(2048).optional(),
+    transcript: z.array(z.object({ start: z.number().min(0), text: z.string().max(2000) })).max(20_000).optional(),
+    duration_seconds: z.number().min(0).optional()
   }).optional(),
   // Who added it, so both phones can show "Added by Dian".
   created_by: z.string().max(100).optional(),
@@ -97,7 +100,9 @@ app.post('/api/sources/import', (req, res) => {
         title: preview.title,
         description: preview.description,
         authorName: preview.author_name,
-        thumbnailUrl: preview.thumbnail_url
+        thumbnailUrl: preview.thumbnail_url,
+        transcript: preview.transcript,
+        durationSeconds: preview.duration_seconds
       },
       createdBy: created_by,
       createdByName: created_by_name,

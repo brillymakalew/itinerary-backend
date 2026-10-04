@@ -25,6 +25,12 @@ export interface ClientPreview {
   description?: string;
   authorName?: string;
   thumbnailUrl?: string;
+  /**
+   * YouTube captions the phone read (YouTube refuses servers in data centres). Each line starts at
+   * [start] seconds into the video.
+   */
+  transcript?: { start: number; text: string }[];
+  durationSeconds?: number;
 }
 
 /** Query parameters that only track the share and never change which post is meant. */

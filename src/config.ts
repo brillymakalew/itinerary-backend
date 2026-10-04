@@ -56,7 +56,7 @@ export function loadConfig(): AppConfig {
     maxUploadBytes: Number(optional('MAX_UPLOAD_MB', '200')) * 1024 * 1024,
     maxFrames: Number(optional('MAX_FRAMES', '12')),
     // Bump with each deploy-worthy change: /health reports it, so a redeploy can be confirmed.
-    pipelineVersion: 'pipeline-2026.10.4',
+    pipelineVersion: 'pipeline-2026.10.5',
     promptVersion: 'extract-v1',
   };
 }

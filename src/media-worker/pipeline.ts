@@ -426,6 +426,25 @@ export class MediaProcessingPipeline {
 
   /** YouTube: read the captions (or transcribe the audio) plus chapters and description. */
   private async runYouTube(job: SourceJob, runId: number) {
+    // YouTube refuses data-centre servers, so the phone reads the captions and sends them along.
+    const fromPhone = job.clientPreview?.transcript ?? [];
+    if (fromPhone.length > 0) {
+      const meta = await this.metadataFor(job, undefined);
+      job.durationSeconds = job.clientPreview?.durationSeconds ?? job.durationSeconds;
+      if (!this.isCurrentRun(job, runId)) return;
+      console.log(`[Pipeline] ${job.sourceId}: using the ${fromPhone.length}-line transcript the app read on the phone`);
+      this.setStage(job, 'analyzing_frames', 'Finding places in the video…');
+      const segments = fromPhone.map(line => ({ start: line.start, end: line.start, text: line.text }));
+      const extraction = await this.extractor.extractFromTranscript(meta, segments, [], {
+        destination: this.destinationOf(job),
+        maxPlaces: MAX_PLACES_LONG,
+        onProgress: detail => this.updateDetail(job, runId, detail)
+      });
+      if (!this.isCurrentRun(job, runId)) return;
+      await this.resolveAndFinish(job, runId, extraction, 'needs_user_correction', 'No specific places were mentioned in this video.');
+      return;
+    }
+
     const canDownload = await this.ytdlp.isAvailable();
     let info: VideoInfo | undefined;
     let failure: YtDlpError | undefined;
