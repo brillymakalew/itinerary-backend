@@ -100,13 +100,15 @@ const ImportRequest = z.object({
   // The trip's destination ("Hanoi and Sapa, Vietnam"); place names are matched near it.
   destination: z.string().max(200).optional(),
   // Set when retrying an import; lets an uploaded video be found again after a server restart.
-  source_id: z.string().max(100).optional()
+  source_id: z.string().max(100).optional(),
+  // false: keep the link to analyze later (no AI or Google calls until then).
+  analyze: z.boolean().optional()
 });
 
 app.post('/api/sources/import', (req, res) => {
   const parsed = ImportRequest.safeParse(req.body);
   if (!parsed.success) return badRequest(res, 'Missing trip_id or url');
-  const { trip_id, url, force, preview, created_by, created_by_name, destination, source_id } = parsed.data;
+  const { trip_id, url, force, preview, created_by, created_by_name, destination, source_id, analyze } = parsed.data;
   if (!/https?:\/\/\S+/i.test(url) && !url.startsWith('upload://')) {
     return badRequest(res, 'Paste a TikTok, Instagram, YouTube or Google Maps link (it should start with https://).');
   }
@@ -125,7 +127,8 @@ app.post('/api/sources/import', (req, res) => {
       createdBy: created_by,
       createdByName: created_by_name,
       destination,
-      sourceId: source_id
+      sourceId: source_id,
+      analyze
     });
     return res.status(202).json({
       source_id: job.sourceId,

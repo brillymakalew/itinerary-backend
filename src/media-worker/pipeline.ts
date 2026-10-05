@@ -15,6 +15,8 @@ import { TaskQueue } from './taskQueue';
 import { SupabaseClient } from '@supabase/supabase-js';
 
 export type PipelineStage =
+  /** Kept to analyze later: nothing has been read or spent yet. */
+  | 'saved'
   | 'added'
   | 'fetching_metadata'
   | 'analyzing_audio'
@@ -59,9 +61,14 @@ export interface ImportOptions {
   createdBy?: string;
   createdByName?: string;
   destination?: string;
-  /** The import being retried; finds an uploaded video again after a server restart. */
+  /** The import being retried; keeps its id (and finds an uploaded video) after a server restart. */
   sourceId?: string;
+  /** False: keep the link to analyze later, without any AI or Google calls yet. */
+  analyze?: boolean;
 }
+
+/** Ids the app sends back for a retry; anything else gets a fresh id. */
+const SOURCE_ID_PATTERN = /^src_[A-Za-z0-9_-]{4,100}$/;
 
 export interface SourceJob {
   sourceId: string;
@@ -211,11 +218,17 @@ export class MediaProcessingPipeline {
   startImportJob(tripId: string, rawUrl: string, options: ImportOptions = {}): SourceJob {
     if (rawUrl.startsWith('upload://')) return this.restartUpload(tripId, rawUrl, options);
     const { normalizedUrl, platform } = SocialAdapters.normalizeUrl(rawUrl);
+    const analyze = options.analyze !== false;
+    const requestedId = options.sourceId && SOURCE_ID_PATTERN.test(options.sourceId) ? options.sourceId : undefined;
 
-    const existing = [...this.jobs.values()].find(j => j.tripId === tripId && j.url === normalizedUrl);
+    const sameLink = (j: SourceJob | undefined) => j && j.tripId === tripId && j.url === normalizedUrl ? j : undefined;
+    const existing = [...this.jobs.values()].find(j => sameLink(j)) ?? sameLink(requestedId ? this.jobs.get(requestedId) : undefined);
     if (existing) {
+      // Saving a link that's already here changes nothing.
+      if (!analyze) return existing;
       const running = ACTIVE_STAGES.includes(existing.status);
-      if (running || (!options.force && existing.status !== 'failed')) return existing;
+      const waiting = existing.status === 'saved' || existing.status === 'failed';
+      if (running || (!options.force && !waiting)) return existing;
       if (options.preview) existing.clientPreview = options.preview;
       if (options.destination) existing.destination = options.destination;
       this.resetJob(existing);
@@ -225,12 +238,13 @@ export class MediaProcessingPipeline {
 
     const now = new Date().toISOString();
     const job: SourceJob = {
-      sourceId: `src_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      // A retry after a server restart keeps its id, so both phones keep one card for it.
+      sourceId: requestedId && !this.jobs.has(requestedId) ? requestedId : `src_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
       tripId,
       url: normalizedUrl,
       platform,
-      status: 'added',
-      statusDetail: platform === 'google_maps' ? 'Opening the Google Maps link…' : 'Waiting to start…',
+      status: analyze ? 'added' : 'saved',
+      statusDetail: !analyze ? undefined : platform === 'google_maps' ? 'Opening the Google Maps link…' : 'Waiting to start…',
       candidateCount: 0,
       reviewedCount: 0,
       candidates: [],
@@ -243,8 +257,21 @@ export class MediaProcessingPipeline {
       destination: options.destination
     };
     this.jobs.set(job.sourceId, job);
-    this.startLinkJob(job);
+    if (analyze) this.startLinkJob(job);
+    else this.keepForLater(job);
     return job;
+  }
+
+  /** A link saved for later shows what the phone read about it; nothing else is fetched. */
+  private keepForLater(job: SourceJob) {
+    const platform: SourcePlatform = job.platform === 'upload' ? 'other_url' : job.platform;
+    const meta = SocialAdapters.fromClientPreview(job.url, platform, job.clientPreview);
+    if (meta) {
+      job.caption = (platform === 'youtube' ? meta.title : meta.caption || meta.title) ?? job.caption;
+      job.creatorName = meta.authorName ?? job.creatorName;
+      job.thumbnailUrl = meta.thumbnailUrl ?? job.thumbnailUrl;
+    }
+    this.setStage(job, 'saved', undefined);
   }
 
   /**

@@ -76,7 +76,7 @@ export function loadConfig(): AppConfig {
     openAiMonthlyBudgetUsd: Number(optional('OPENAI_MONTHLY_BUDGET_USD', '5')),
     googleFreeCaps: jsonObject('GOOGLE_FREE_CAPS'),
     // Bump with each deploy-worthy change: /health reports it, so a redeploy can be confirmed.
-    pipelineVersion: 'pipeline-2026.10.6',
+    pipelineVersion: 'pipeline-2026.10.7',
     promptVersion: 'extract-v1',
   };
 }
