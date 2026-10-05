@@ -36,6 +36,9 @@ export interface AppConfig {
   openAiMonthlyBudgetUsd: number;
   /** Overrides for Google's free calls per SKU, e.g. {"place_photos": 1000}. */
   googleFreeCaps: Record<string, number>;
+  /** Disk kept for the Reels feed's videos; the least recently watched go first. */
+  videoCacheMaxBytes: number;
+  videoRetentionDays: number;
 }
 
 function jsonObject(name: string): Record<string, number> {
@@ -75,8 +78,10 @@ export function loadConfig(): AppConfig {
     maxConcurrentImports: Number(optional('MAX_CONCURRENT_IMPORTS', '2')),
     openAiMonthlyBudgetUsd: Number(optional('OPENAI_MONTHLY_BUDGET_USD', '5')),
     googleFreeCaps: jsonObject('GOOGLE_FREE_CAPS'),
+    videoCacheMaxBytes: Number(optional('VIDEO_CACHE_MAX_MB', '3072')) * 1024 * 1024,
+    videoRetentionDays: Number(optional('VIDEO_RETENTION_DAYS', '60')),
     // Bump with each deploy-worthy change: /health reports it, so a redeploy can be confirmed.
-    pipelineVersion: 'pipeline-2026.10.7',
+    pipelineVersion: 'pipeline-2026.10.8',
     promptVersion: 'extract-v1',
   };
 }

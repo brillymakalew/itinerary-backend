@@ -7,7 +7,9 @@ import fs from 'fs';
 import { z } from 'zod';
 import { loadConfig } from './config';
 import { ItinerarySolver, SolverInput } from './itinerary/solver';
-import { MediaProcessingPipeline, publicJob } from './media-worker/pipeline';
+import { MediaProcessingPipeline, publicJob, SOURCE_ID_PATTERN } from './media-worker/pipeline';
+import { SocialAdapters } from './media-worker/adapters/socialAdapters';
+import { VideoStore } from './media-worker/videoStore';
 import { PHOTO_NAME_PATTERN, PhotoGoneError, PlaceMediaService } from './places/placeMediaService';
 import { PlaceLookupError, PlaceLookupService } from './places/placeLookup';
 import { requireApiToken } from './auth';
@@ -302,6 +304,39 @@ app.get('/api/places/photo', async (req, res) => {
     console.warn('[Places] photo lookup failed:', err.message);
     return res.status(502).json({ error: 'Photo unavailable' });
   }
+});
+
+// POST /api/videos/prepare — gets imports' videos ready for the Reels feed (TikTok and Instagram are
+// downloaded to the server; YouTube refuses servers, so the app plays those with YouTube's player).
+const PrepareVideos = z.object({
+  items: z.array(z.object({
+    source_id: z.string().max(120),
+    url: z.string().max(2048),
+    retry: z.boolean().optional()
+  })).min(1).max(20)
+});
+
+app.post('/api/videos/prepare', (req, res) => {
+  const parsed = PrepareVideos.safeParse(req.body);
+  if (!parsed.success) return badRequest(res, parsed.error);
+  const results = parsed.data.items.map(item => {
+    if (!SOURCE_ID_PATTERN.test(item.source_id)) return { source_id: item.source_id, state: 'failed', error: 'Unknown import' };
+    if (pipeline.videoFileFor(item.source_id)) return { source_id: item.source_id, state: 'ready' };
+    const { normalizedUrl, platform } = SocialAdapters.normalizeUrl(item.url);
+    if (platform !== 'tiktok' && platform !== 'instagram') return { source_id: item.source_id, state: 'unsupported' };
+    return { source_id: item.source_id, ...pipeline.videos.prepare(item.source_id, normalizedUrl, item.retry ?? false) };
+  });
+  return res.json({ results });
+});
+
+// GET /api/videos/:sourceId — the video itself (supports Range requests, so playback can seek).
+app.get('/api/videos/:sourceId', (req, res) => {
+  const { sourceId } = req.params;
+  const file = SOURCE_ID_PATTERN.test(sourceId) ? pipeline.videoFileFor(sourceId) : undefined;
+  if (!file) return res.status(404).json({ error: 'This video isn’t ready yet.', ...pipeline.videos.status(sourceId) });
+  res.set('Cache-Control', 'private, max-age=86400');
+  res.type(VideoStore.contentType(file));
+  return res.sendFile(file);
 });
 
 // 18.5 POST /api/trip-days/:id/optimize (PRD §18.5)

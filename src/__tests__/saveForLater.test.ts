@@ -27,9 +27,14 @@ describe('links saved for later', () => {
       supabaseServiceRoleKey: '',
       maxConcurrentImports: 1,
       openAiMonthlyBudgetUsd: 5,
-      googleFreeCaps: {}
+      googleFreeCaps: {},
+      videoCacheMaxBytes: 10 * 1024 * 1024,
+      videoRetentionDays: 1
     };
-    const noVideoDownloads = { isAvailable: () => Promise.resolve(false) } as any;
+    const noVideoDownloads = {
+      isAvailable: () => Promise.resolve(false),
+      downloadVideo: () => Promise.reject(new Error('offline in tests'))
+    } as any;
     return new MediaProcessingPipeline(config, noVideoDownloads);
   };
 

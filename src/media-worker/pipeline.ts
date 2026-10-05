@@ -12,6 +12,7 @@ import { getSupabaseClient } from '../supabase';
 import { JsonFileCache } from '../places/fileCache';
 import { UsageMeter } from '../usage/usageMeter';
 import { TaskQueue } from './taskQueue';
+import { VideoStore } from './videoStore';
 import { SupabaseClient } from '@supabase/supabase-js';
 
 export type PipelineStage =
@@ -68,7 +69,7 @@ export interface ImportOptions {
 }
 
 /** Ids the app sends back for a retry; anything else gets a fresh id. */
-const SOURCE_ID_PATTERN = /^src_[A-Za-z0-9_-]{4,100}$/;
+export const SOURCE_ID_PATTERN = /^src_[A-Za-z0-9_-]{4,100}$/;
 
 export interface SourceJob {
   sourceId: string;
@@ -179,6 +180,8 @@ export class MediaProcessingPipeline {
   private extendedColumns = { sources: true, candidates: true };
   /** Imports wait here for a free slot (MAX_CONCURRENT_IMPORTS at a time). */
   private queue: TaskQueue<SourceJob>;
+  /** Downloaded videos kept for the app's Reels feed. */
+  readonly videos: VideoStore;
 
   constructor(
     config: AppConfig,
@@ -199,6 +202,11 @@ export class MediaProcessingPipeline {
     this.ytdlp = ytdlp;
     this.placeLookup = placeLookup;
     this.supabase = getSupabaseClient(config);
+    this.videos = new VideoStore(path.resolve(config.dataDir, 'videos'), ytdlp, {
+      maxBytes: config.videoCacheMaxBytes,
+      retentionMs: config.videoRetentionDays * 24 * 60 * 60 * 1000,
+      maxVideoBytes: MAX_VIDEO_BYTES
+    });
     this.storageDir = path.resolve(config.dataDir, 'uploads');
     this.workRoot = path.resolve(config.dataDir, 'work');
     fs.mkdirSync(this.storageDir, { recursive: true });
@@ -272,6 +280,8 @@ export class MediaProcessingPipeline {
       job.thumbnailUrl = meta.thumbnailUrl ?? job.thumbnailUrl;
     }
     this.setStage(job, 'saved', undefined);
+    // Ready to watch in the Reels feed: downloading costs nothing from the free tier.
+    if (job.platform === 'tiktok' || job.platform === 'instagram') this.videos.prepare(job.sourceId, job.url);
   }
 
   /**
@@ -323,6 +333,14 @@ export class MediaProcessingPipeline {
   /** Whether yt-dlp works here, i.e. TikTok/Instagram/YouTube videos can be downloaded. */
   canDownloadVideos(): Promise<boolean> {
     return this.ytdlp.isAvailable();
+  }
+
+  /** The video file to play for [sourceId]: a kept download or an uploaded video. */
+  videoFileFor(sourceId: string): string | undefined {
+    const stored = this.videos.find(sourceId);
+    if (stored) return stored;
+    const upload = this.findUpload(sourceId);
+    return upload && fs.existsSync(upload) ? upload : undefined;
   }
 
   getJob(sourceId: string): SourceJob | undefined {
@@ -482,7 +500,12 @@ export class MediaProcessingPipeline {
       }
 
       if (videoPath) {
-        await this.analyzeVideoFile(job, runId, videoPath, meta, 'No places were found in this video.');
+        try {
+          await this.analyzeVideoFile(job, runId, videoPath, meta, 'No places were found in this video.');
+        } finally {
+          // Kept for the Reels feed rather than downloaded again.
+          if (fs.existsSync(videoPath)) this.videos.keep(job.sourceId, videoPath);
+        }
       } else if (meta.hasMetadata && meta.caption) {
         this.setStage(job, 'analyzing_frames', 'Finding places in the caption…');
         const extraction = await this.extractor.extractFromMetadata(meta, this.destinationOf(job));
