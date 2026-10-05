@@ -3,6 +3,9 @@
 
 import fs from 'fs';
 import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+import ffmpegPath from 'ffmpeg-static';
 import { TaskQueue } from './taskQueue';
 import { YtDlp, YtDlpError } from './ytDlp';
 
@@ -23,6 +26,7 @@ export interface VideoStoreOptions {
 
 const CONTENT_TYPES: Record<string, string> = { '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime', '.m4v': 'video/mp4' };
 const PRUNE_EVERY_WRITES = 10;
+const execFileAsync = promisify(execFile);
 
 export class VideoStore {
   private failures = new Map<string, string>();
@@ -121,6 +125,27 @@ export class VideoStore {
     return { state: 'preparing' };
   }
 
+  /**
+   * A still from [videoFile] for the app's grid and while a reel loads (platform thumbnails
+   * expire). Made once and kept next to the videos.
+   */
+  async poster(sourceId: string, videoFile: string): Promise<string | undefined> {
+    const target = path.join(this.dir, '.posters', `${VideoStore.safeId(sourceId)}.jpg`);
+    if (fs.existsSync(target)) return target;
+    if (!ffmpegPath) return undefined;
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    try {
+      await execFileAsync(ffmpegPath, ['-ss', '1', '-i', videoFile, '-frames:v', '1', '-vf', 'scale=480:-2', '-q:v', '5', '-y', target], {
+        timeout: 20_000
+      });
+    } catch {
+      // Videos shorter than a second: take the first frame instead.
+      await execFileAsync(ffmpegPath, ['-i', videoFile, '-frames:v', '1', '-vf', 'scale=480:-2', '-q:v', '5', '-y', target], { timeout: 20_000 })
+        .catch(() => undefined);
+    }
+    return fs.existsSync(target) ? target : undefined;
+  }
+
   /** Drops videos past their retention, then the least recently watched while over the size cap. */
   prune() {
     try {
@@ -137,6 +162,14 @@ export class VideoStore {
       for (const entry of files) {
         total += entry.size;
         if (now - entry.mtimeMs > this.options.retentionMs || total > this.options.maxBytes) fs.rmSync(entry.file, { force: true });
+      }
+      // Posters of videos that are gone.
+      const posters = path.join(this.dir, '.posters');
+      if (fs.existsSync(posters)) {
+        const kept = new Set(fs.readdirSync(this.dir).filter(n => !n.startsWith('.')).map(n => path.parse(n).name));
+        for (const name of fs.readdirSync(posters)) {
+          if (!kept.has(path.parse(name).name)) fs.rmSync(path.join(posters, name), { force: true });
+        }
       }
       // Leftovers of interrupted downloads.
       for (const name of fs.readdirSync(this.dir).filter(n => n.startsWith('.dl-'))) {

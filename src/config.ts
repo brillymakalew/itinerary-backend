@@ -81,7 +81,7 @@ export function loadConfig(): AppConfig {
     videoCacheMaxBytes: Number(optional('VIDEO_CACHE_MAX_MB', '3072')) * 1024 * 1024,
     videoRetentionDays: Number(optional('VIDEO_RETENTION_DAYS', '60')),
     // Bump with each deploy-worthy change: /health reports it, so a redeploy can be confirmed.
-    pipelineVersion: 'pipeline-2026.10.8',
+    pipelineVersion: 'pipeline-2026.10.9',
     promptVersion: 'extract-v1',
   };
 }

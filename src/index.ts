@@ -329,6 +329,16 @@ app.post('/api/videos/prepare', (req, res) => {
   return res.json({ results });
 });
 
+// GET /api/videos/:sourceId/poster — a still from the stored video (platform thumbnails expire).
+app.get('/api/videos/:sourceId/poster', async (req, res) => {
+  const { sourceId } = req.params;
+  const file = SOURCE_ID_PATTERN.test(sourceId) ? pipeline.videoFileFor(sourceId) : undefined;
+  const poster = file ? await pipeline.videos.poster(sourceId, file) : undefined;
+  if (!poster) return res.status(404).json({ error: 'No poster for this video yet.' });
+  res.set('Cache-Control', 'private, max-age=604800');
+  return res.type('image/jpeg').sendFile(poster);
+});
+
 // GET /api/videos/:sourceId — the video itself (supports Range requests, so playback can seek).
 app.get('/api/videos/:sourceId', (req, res) => {
   const { sourceId } = req.params;
