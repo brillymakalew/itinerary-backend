@@ -8,9 +8,10 @@ import { z } from 'zod';
 import { loadConfig } from './config';
 import { ItinerarySolver, SolverInput } from './itinerary/solver';
 import { MediaProcessingPipeline, publicJob } from './media-worker/pipeline';
-import { PHOTO_NAME_PATTERN, PlaceMediaService } from './places/placeMediaService';
+import { PHOTO_NAME_PATTERN, PhotoGoneError, PlaceMediaService } from './places/placeMediaService';
 import { PlaceLookupError, PlaceLookupService } from './places/placeLookup';
 import { requireApiToken } from './auth';
+import { UsageLimitError, UsageMeter } from './usage/usageMeter';
 
 const config = loadConfig();
 const app = express();
@@ -23,9 +24,15 @@ if (config.apiToken) app.use('/api', requireApiToken(config.apiToken));
 app.use(express.json({ limit: '3mb' }));
 
 const solver = new ItinerarySolver();
-const placeLookup = new PlaceLookupService(config.googleApiKey);
-const pipeline = new MediaProcessingPipeline(config, undefined, placeLookup);
-const placeMedia = new PlaceMediaService(config.googleApiKey);
+// Counts OpenAI and Google Maps spend per month (see GET /api/usage); calls stop at 90% of the free tier.
+const usage = new UsageMeter({
+  filePath: path.resolve(config.dataDir, 'usage.json'),
+  openAiBudgetUsd: config.openAiMonthlyBudgetUsd,
+  googleFreeCaps: config.googleFreeCaps
+});
+const placeLookup = new PlaceLookupService(config.googleApiKey, usage);
+const pipeline = new MediaProcessingPipeline(config, undefined, placeLookup, usage);
+const placeMedia = new PlaceMediaService(config.googleApiKey, usage, { cacheDir: path.resolve(config.dataDir, 'cache') });
 
 // Multer upload config for video/screenshot fallbacks (PRD §9.2)
 const uploadDir = path.resolve(config.dataDir, 'temp_uploads');
@@ -48,6 +55,10 @@ const toMinutes = (hhmm: string) => {
 const badRequest = (res: express.Response, error: z.ZodError | string) =>
   res.status(400).json({ error: typeof error === 'string' ? error : error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ') });
 
+/** The free-tier pause, answered as 429 with a message the app shows as is. */
+const freeTierPaused = (res: express.Response, err: UsageLimitError) =>
+  res.status(429).json({ error: err.message, code: 'free_tier_paused', provider: err.provider });
+
 // Health Check
 app.get('/health', async (req, res) => {
   res.json({
@@ -57,9 +68,16 @@ app.get('/health', async (req, res) => {
     capabilities: {
       placeMedia: placeMedia.isConfigured,
       placeSearch: placeLookup.isConfigured,
-      videoDownload: await pipeline.canDownloadVideos()
+      videoDownload: await pipeline.canDownloadVideos(),
+      usage: true
     }
   });
+});
+
+// GET /api/usage — this month's OpenAI spend and Google Maps calls against the free tier.
+app.get('/api/usage', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  return res.json(usage.snapshot());
 });
 
 // 18.1 POST /api/sources/import (PRD §18.1) — returns immediately; poll GET /api/sources/:id.
@@ -190,6 +208,7 @@ app.get('/api/places/search', async (req, res) => {
   const near = lat !== undefined && lng !== undefined ? { latitude: lat, longitude: lng } : undefined;
   try {
     // Without coordinates the city in the text keeps results in the right country.
+    // Pro fields only (no ratings): the Enterprise SKU has a fifth of the free calls.
     const places = await placeLookup.search(near || !city ? q : `${q} ${city}`, near);
     return res.json({
       results: places.map(p => ({
@@ -207,6 +226,7 @@ app.get('/api/places/search', async (req, res) => {
       }))
     });
   } catch (err: any) {
+    if (err instanceof UsageLimitError) return freeTierPaused(res, err);
     if (err instanceof PlaceLookupError) return res.status(err.status).json({ error: err.message });
     console.warn('[Places] search failed:', err.message);
     return res.status(502).json({ error: 'Google Maps search is unavailable right now.' });
@@ -223,18 +243,20 @@ app.post('/api/places/resolve-link', async (req, res) => {
     const place = await placeLookup.resolveMapsLink(parsed.data.text);
     return res.json({ place });
   } catch (err: any) {
+    if (err instanceof UsageLimitError) return freeTierPaused(res, err);
     if (err instanceof PlaceLookupError) return res.status(err.status).json({ error: err.message });
     console.warn('[Places] link lookup failed:', err.message);
     return res.status(502).json({ error: 'Couldn’t open that Google Maps link right now. Try again.' });
   }
 });
 
-// GET /api/places/media — photos, rating, hours and website for a place (PRD §9.6).
+// GET /api/places/media — photos for a place; with detail=1 also rating, hours and website (PRD §9.6).
 const MediaQuery = z.object({
   name: z.string().min(1).max(300),
   lat: z.coerce.number().min(-90).max(90).optional(),
   lng: z.coerce.number().min(-180).max(180).optional(),
-  placeId: z.string().max(300).optional()
+  placeId: z.string().max(300).optional(),
+  detail: z.enum(['0', '1', 'true', 'false']).optional()
 });
 
 app.get('/api/places/media', async (req, res) => {
@@ -243,32 +265,37 @@ app.get('/api/places/media', async (req, res) => {
   if (!placeMedia.isConfigured) {
     return res.status(503).json({ error: 'Place photos need GOOGLE_PLACES_API_KEY on the server.' });
   }
-  const { name, lat, lng, placeId } = parsed.data;
+  const { name, lat, lng, placeId, detail } = parsed.data;
   try {
     const media = await placeMedia.getMedia({
       name,
       placeId,
-      location: lat !== undefined && lng !== undefined ? { latitude: lat, longitude: lng } : undefined
+      location: lat !== undefined && lng !== undefined ? { latitude: lat, longitude: lng } : undefined,
+      detail: detail === '1' || detail === 'true'
     });
     if (!media) return res.status(404).json({ error: 'No matching place found on Google Maps.' });
     res.set('Cache-Control', 'private, max-age=3600');
     return res.json(media);
   } catch (err: any) {
+    if (err instanceof UsageLimitError) return freeTierPaused(res, err);
     console.warn('[Places] media lookup failed:', err.message);
     return res.status(502).json({ error: 'Google Maps is unavailable right now.' });
   }
 });
 
-// GET /api/places/photo — redirects to the image so the API key never reaches the client.
+// GET /api/places/photo — the image itself, served from the server's cache so the API key never
+// reaches the client and each photo is fetched from Google only once.
 app.get('/api/places/photo', async (req, res) => {
   const name = String(req.query.name ?? '');
   if (!PHOTO_NAME_PATTERN.test(name)) return badRequest(res, 'Invalid photo name');
   const maxWidth = Math.min(1600, Math.max(100, Number(req.query.maxWidth) || 800));
   try {
-    const uri = await placeMedia.resolvePhotoUri(name, maxWidth);
-    res.set('Cache-Control', 'public, max-age=3600');
-    return res.redirect(302, uri);
+    const photo = await placeMedia.getPhoto(name, maxWidth);
+    res.set('Cache-Control', 'private, max-age=2592000, immutable');
+    return res.type(photo.contentType).send(photo.bytes);
   } catch (err: any) {
+    if (err instanceof UsageLimitError) return freeTierPaused(res, err);
+    if (err instanceof PhotoGoneError) return res.status(404).json({ error: 'Photo no longer available' });
     console.warn('[Places] photo lookup failed:', err.message);
     return res.status(502).json({ error: 'Photo unavailable' });
   }
@@ -366,6 +393,15 @@ app.post('/api/trip-days/:id/optimize', (req, res) => {
   });
 });
 
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`Vibi API listening on port ${port} (API token ${config.apiToken ? 'required' : 'not required'})`);
 });
+
+// Usage counts are written every few seconds; a stop (docker compose down) writes the last ones.
+for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+  process.on(signal, () => {
+    usage.flush();
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3_000).unref();
+  });
+}

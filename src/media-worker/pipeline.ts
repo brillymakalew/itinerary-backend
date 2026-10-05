@@ -4,11 +4,14 @@ import fs from 'fs';
 import path from 'path';
 import { ClientPreview, SocialAdapters, SocialMetadata, SourcePlatform } from './adapters/socialAdapters';
 import { DEFAULT_DESTINATION, ExtractionResult, foldName, OpenAiExtractor } from './openaiExtractor';
-import { GooglePlacesResolver, ResolvedCandidate } from './googlePlacesResolver';
+import { GooglePlacesResolver, ProviderMatch, RESOLUTION_CACHE_TTL_MS, ResolvedCandidate } from './googlePlacesResolver';
 import { TranscriptSegment, VideoInfo, YtDlp, YtDlpError } from './ytDlp';
 import { PlaceLookupError, PlaceLookupService } from '../places/placeLookup';
 import { AppConfig } from '../config';
 import { getSupabaseClient } from '../supabase';
+import { JsonFileCache } from '../places/fileCache';
+import { UsageMeter } from '../usage/usageMeter';
+import { TaskQueue } from './taskQueue';
 import { SupabaseClient } from '@supabase/supabase-js';
 
 export type PipelineStage =
@@ -86,6 +89,8 @@ export interface SourceJob {
   destination?: string;
   /** Uploaded video kept on the server so "Analyze again" works. */
   mediaPath?: string;
+  /** 1 = next to start, while the job waits for a free slot. */
+  queuePosition?: number;
 }
 
 /** The job as the app sees it (no server paths or internal state). */
@@ -165,10 +170,25 @@ export class MediaProcessingPipeline {
   private syncTimers = new Map<string, NodeJS.Timeout>();
   /** Flipped off if the database hasn't had the newer columns added yet (see supabase/migrations). */
   private extendedColumns = { sources: true, candidates: true };
+  /** Imports wait here for a free slot (MAX_CONCURRENT_IMPORTS at a time). */
+  private queue: TaskQueue<SourceJob>;
 
-  constructor(config: AppConfig, ytdlp = new YtDlp(), placeLookup = new PlaceLookupService(config.googleApiKey)) {
-    this.extractor = new OpenAiExtractor(config.openaiApiKey, config.visionModel, config.transcriptionModel);
-    this.placesResolver = new GooglePlacesResolver(config.googleApiKey);
+  constructor(
+    config: AppConfig,
+    ytdlp = new YtDlp(),
+    placeLookup = new PlaceLookupService(config.googleApiKey),
+    private readonly meter?: UsageMeter
+  ) {
+    this.extractor = new OpenAiExtractor(config.openaiApiKey, config.visionModel, config.transcriptionModel, meter);
+    const matchCache = new JsonFileCache<ProviderMatch[]>(path.resolve(config.dataDir, 'cache', 'place-matches.json'), RESOLUTION_CACHE_TTL_MS, 10_000);
+    this.placesResolver = new GooglePlacesResolver(config.googleApiKey, meter, matchCache);
+    this.queue = new TaskQueue<SourceJob>(
+      config.maxConcurrentImports,
+      waiting => waiting.forEach((job, index) => this.showQueuePosition(job, index)),
+      job => {
+        job.queuePosition = undefined;
+      }
+    );
     this.ytdlp = ytdlp;
     this.placeLookup = placeLookup;
     this.supabase = getSupabaseClient(config);
@@ -199,7 +219,7 @@ export class MediaProcessingPipeline {
       if (options.preview) existing.clientPreview = options.preview;
       if (options.destination) existing.destination = options.destination;
       this.resetJob(existing);
-      this.runLinkJob(existing);
+      this.startLinkJob(existing);
       return existing;
     }
 
@@ -209,8 +229,8 @@ export class MediaProcessingPipeline {
       tripId,
       url: normalizedUrl,
       platform,
-      status: 'fetching_metadata',
-      statusDetail: platform === 'google_maps' ? 'Opening the Google Maps link…' : 'Reading the post…',
+      status: 'added',
+      statusDetail: platform === 'google_maps' ? 'Opening the Google Maps link…' : 'Waiting to start…',
       candidateCount: 0,
       reviewedCount: 0,
       candidates: [],
@@ -223,7 +243,7 @@ export class MediaProcessingPipeline {
       destination: options.destination
     };
     this.jobs.set(job.sourceId, job);
-    this.runLinkJob(job);
+    this.startLinkJob(job);
     return job;
   }
 
@@ -269,7 +289,7 @@ export class MediaProcessingPipeline {
     job.createdBy = job.createdBy ?? options.createdBy;
     job.createdByName = job.createdByName ?? options.createdByName;
     job.destination = options.destination ?? job.destination;
-    this.runUploadJob(job);
+    this.queue.enqueue(job, () => this.runUploadJob(job));
     return job;
   }
 
@@ -304,11 +324,34 @@ export class MediaProcessingPipeline {
     return false;
   }
 
+  // ---- Queue -----------------------------------------------------------------------------
+
+  /** Google Maps links take a second and no AI, so they never wait behind videos. */
+  private startLinkJob(job: SourceJob) {
+    if (job.platform === 'google_maps') void this.runLinkJob(job);
+    else this.queue.enqueue(job, () => this.runLinkJob(job));
+  }
+
+  private showQueuePosition(job: SourceJob, index: number) {
+    const detail = index === 0 ? 'Next in line…' : `Waiting in line (${index} ahead)…`;
+    job.queuePosition = index + 1;
+    if (job.status !== 'added' || job.statusDetail !== detail) this.setStage(job, 'added', detail);
+  }
+
+  /** Refuses an import the free tier can't cover before anything is spent on it. */
+  private checkFreeTier(job: SourceJob) {
+    if (!this.meter) return;
+    if (job.platform !== 'google_maps') this.meter.assertOpenAi();
+    this.meter.assertGoogle('text_search_pro');
+  }
+
   // ---- Runs ------------------------------------------------------------------------------
 
-  private runLinkJob(job: SourceJob) {
+  private runLinkJob(job: SourceJob): Promise<void> {
     const runId = this.beginRun(job);
     const work = (async () => {
+      this.checkFreeTier(job);
+      if (job.platform !== 'google_maps') this.setStage(job, 'fetching_metadata', 'Reading the post…');
       switch (job.platform) {
         case 'google_maps':
           return this.runMapsLink(job, runId);
@@ -321,12 +364,11 @@ export class MediaProcessingPipeline {
           return this.runWebPage(job, runId);
       }
     })();
-    this.supervise(job, runId, work, JOB_TIMEOUT_MS[job.platform]);
+    return this.supervise(job, runId, work, JOB_TIMEOUT_MS[job.platform]);
   }
 
-  private runUploadJob(job: SourceJob) {
+  private runUploadJob(job: SourceJob): Promise<void> {
     const runId = this.beginRun(job);
-    this.setStage(job, 'analyzing_audio', 'Listening to the audio…');
     const meta: SocialMetadata = {
       platform: job.platform === 'upload' ? 'other_url' : job.platform,
       originalUrl: job.url,
@@ -334,8 +376,12 @@ export class MediaProcessingPipeline {
       caption: job.caption,
       hasAnalyzableMedia: true
     };
-    const work = this.analyzeVideoFile(job, runId, job.mediaPath!, meta, 'No places were found in this video.');
-    this.supervise(job, runId, work, JOB_TIMEOUT_MS.upload);
+    const work = (async () => {
+      this.checkFreeTier(job);
+      this.setStage(job, 'analyzing_audio', 'Listening to the audio…');
+      await this.analyzeVideoFile(job, runId, job.mediaPath!, meta, 'No places were found in this video.');
+    })();
+    return this.supervise(job, runId, work, JOB_TIMEOUT_MS.upload);
   }
 
   /** "Analyze again" on an uploaded video, finding the stored file even after a restart. */
@@ -370,7 +416,7 @@ export class MediaProcessingPipeline {
     this.resetJob(target);
     target.mediaPath = mediaPath;
     target.destination = options.destination ?? target.destination;
-    this.runUploadJob(target);
+    this.queue.enqueue(target, () => this.runUploadJob(target));
     return target;
   }
 
@@ -730,7 +776,7 @@ export class MediaProcessingPipeline {
     job.candidateCount = 0;
     job.reviewedCount = 0;
     job.createdAt = new Date().toISOString();
-    this.setStage(job, 'fetching_metadata', job.platform === 'upload' ? 'Starting again…' : 'Reading the post…');
+    this.setStage(job, 'added', job.platform === 'google_maps' ? 'Opening the Google Maps link…' : 'Waiting to start…');
   }
 
   private makeWorkDir(job: SourceJob, runId: number): string {

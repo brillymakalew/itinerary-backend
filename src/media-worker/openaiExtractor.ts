@@ -8,6 +8,7 @@ import { promisify } from 'util';
 import ffmpegPath from 'ffmpeg-static';
 import { SocialMetadata } from './adapters/socialAdapters';
 import { mergeSegments, TranscriptSegment, VideoChapter } from './ytDlp';
+import { UsageLimitError, UsageMeter } from '../usage/usageMeter';
 
 const execFileAsync = promisify(execFile);
 
@@ -64,6 +65,11 @@ export function describeAiError(err: any): string {
   }
   if (err?.name === 'APIConnectionError') return "Couldn't reach the AI service from the server.";
   return `AI analysis failed: ${err?.message ?? 'unknown error'}`;
+}
+
+/** A failed AI call as a readable error; the free-tier pause keeps its own message. */
+function asAiError(err: unknown): Error {
+  return err instanceof UsageLimitError ? err : new Error(describeAiError(err));
 }
 
 /** OpenAI rejects the whole request when it can't download an image URL (expired or blocked CDN link). */
@@ -174,7 +180,12 @@ export class OpenAiExtractor {
   private model: string;
   private transcriptionModel: string;
 
-  constructor(apiKey: string, model: string = 'gpt-4o-mini', transcriptionModel: string = 'whisper-1') {
+  constructor(
+    apiKey: string,
+    model: string = 'gpt-4o-mini',
+    transcriptionModel: string = 'whisper-1',
+    private readonly meter?: UsageMeter
+  ) {
     // Bounded latency: one quick retry, then fail visibly instead of hanging the import.
     this.openai = new OpenAI({ apiKey, timeout: 60_000, maxRetries: 1 });
     this.model = model;
@@ -217,7 +228,7 @@ ${rules(DEFAULT_MAX_PLACES, 'the caption text and the attached thumbnail. You ca
       return sanitize(JSON.parse(raw), metadata.caption || 'Extracted places', DEFAULT_MAX_PLACES);
     } catch (err) {
       console.error('[OpenAiExtractor] Extraction failed:', err);
-      throw new Error(describeAiError(err));
+      throw asAiError(err);
     }
   }
 
@@ -250,6 +261,7 @@ ${rules(DEFAULT_MAX_PLACES, 'the caption text and the attached thumbnail. You ca
         const audioPath = await this.extractAudio(mediaFilePath, workDir, duration);
         if (audioPath) segments = await this.transcribe(audioPath);
       } catch (audioErr: any) {
+        if (audioErr instanceof UsageLimitError) throw audioErr;
         console.warn('[OpenAiExtractor] Audio transcription skipped/failed:', audioErr?.message ?? audioErr);
       }
 
@@ -285,7 +297,7 @@ ${rules(maxPlaces, 'the caption, the speech transcript and the attached frames')
         return sanitize(JSON.parse(raw), metadata.caption || 'Video', maxPlaces);
       } catch (err) {
         console.error('[OpenAiExtractor] Multimodal extraction failed:', err);
-        throw new Error(describeAiError(err));
+        throw asAiError(err);
       }
     } finally {
       fs.rmSync(workDir, { recursive: true, force: true });
@@ -351,7 +363,7 @@ ${rules(perChunk, 'the title, description, chapters and transcript above')}`;
         results[index] = sanitize(JSON.parse(raw), metadata.title || 'Video', perChunk).places;
       } catch (err) {
         console.error(`[OpenAiExtractor] Transcript chunk ${index + 1} failed:`, err);
-        throw new Error(describeAiError(err));
+        throw asAiError(err);
       } finally {
         done++;
         if (chunks.length > 1) options.onProgress?.(`Finding places in the video (${done} of ${chunks.length} parts)…`);
@@ -371,10 +383,14 @@ ${rules(perChunk, 'the title, description, chapters and transcript above')}`;
     if (fs.statSync(audioPath).size > MAX_TRANSCRIPTION_BYTES) {
       throw new Error('The audio is too long to transcribe in one go.');
     }
+    this.meter?.assertOpenAi();
     const transcription: any = await this.openai.audio.transcriptions.create(
       { file: fs.createReadStream(audioPath), model: this.transcriptionModel, response_format: 'verbose_json' },
       { timeout: 300_000 }
     );
+    // Billed per minute of audio; verbose_json reports the length.
+    const lastSegmentEnd = Array.isArray(transcription.segments) ? Number(transcription.segments.at(-1)?.end) || 0 : 0;
+    this.meter?.recordOpenAiAudio(this.transcriptionModel, Number(transcription.duration) || lastSegmentEnd);
     if (Array.isArray(transcription.segments) && transcription.segments.length > 0) {
       return transcription.segments.map((seg: any) => ({ start: seg.start, end: seg.end, text: String(seg.text).trim() }));
     }
@@ -431,6 +447,7 @@ ${rules(perChunk, 'the title, description, chapters and transcript above')}`;
   }
 
   private async complete(content: any[], timeoutMs = 60_000): Promise<string> {
+    this.meter?.assertOpenAi();
     const response = await this.openai.chat.completions.create(
       {
         model: this.model,
@@ -440,6 +457,9 @@ ${rules(perChunk, 'the title, description, chapters and transcript above')}`;
       },
       { timeout: timeoutMs }
     );
+    if (response.usage) {
+      this.meter?.recordOpenAiTokens(response.model || this.model, response.usage.prompt_tokens ?? 0, response.usage.completion_tokens ?? 0);
+    }
     return response.choices[0]?.message?.content || '{}';
   }
 }

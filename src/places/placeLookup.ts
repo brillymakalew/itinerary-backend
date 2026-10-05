@@ -3,6 +3,7 @@
 
 import { distanceMeters, LatLng } from '../itinerary/travel';
 import { isGoogleHost } from '../media-worker/adapters/socialAdapters';
+import { GoogleSku, UsageMeter } from '../usage/usageMeter';
 
 export interface PlaceSummary {
   providerPlaceId: string;
@@ -31,9 +32,14 @@ export class PlaceLookupError extends Error {
 }
 
 const PLACES_API = 'https://places.googleapis.com/v1';
-const FIELDS = ['id', 'displayName', 'formattedAddress', 'location', 'types', 'primaryType', 'rating', 'userRatingCount', 'priceLevel', 'googleMapsUri'];
-const SEARCH_FIELD_MASK = FIELDS.map(f => `places.${f}`).join(',');
-const DETAIL_FIELD_MASK = FIELDS.join(',');
+/**
+ * Pro fields bill the Pro SKUs (5,000 free calls a month); adding ratings or price levels moves a
+ * request to Enterprise (1,000 free), so they're only asked for when shown.
+ */
+const PRO_FIELDS = ['id', 'displayName', 'formattedAddress', 'location', 'types', 'primaryType', 'googleMapsUri'];
+const ENTERPRISE_FIELDS = [...PRO_FIELDS, 'rating', 'userRatingCount', 'priceLevel'];
+export type LookupDetail = 'pro' | 'enterprise';
+const fieldsFor = (detail: LookupDetail) => (detail === 'pro' ? PRO_FIELDS : ENTERPRISE_FIELDS);
 const REQUEST_TIMEOUT_MS = 8_000;
 const MAX_REDIRECTS = 6;
 /** A named link's coordinates and the place Google finds for that name should be this close. */
@@ -141,26 +147,30 @@ function isAllowedRedirectHost(hostname: string): boolean {
 }
 
 export class PlaceLookupService {
-  constructor(private readonly apiKey: string) {}
+  constructor(private readonly apiKey: string, private readonly meter?: UsageMeter) {}
 
   get isConfigured(): boolean {
     return Boolean(this.apiKey) && !this.apiKey.includes('your-google-places');
   }
 
   /** Name search, biased toward [near] when given (e.g. the day's city). */
-  async search(query: string, near?: LatLng, radiusMeters = 30_000, maxResults = 8): Promise<PlaceSummary[]> {
+  async search(query: string, near?: LatLng, radiusMeters = 30_000, maxResults = 8, detail: LookupDetail = 'pro'): Promise<PlaceSummary[]> {
     const body: Record<string, unknown> = { textQuery: query, maxResultCount: maxResults, languageCode: 'en' };
     if (near) body.locationBias = { circle: { center: near, radius: Math.min(radiusMeters, 50_000) } };
-    const data = await this.post('places:searchText', body, SEARCH_FIELD_MASK);
+    const mask = fieldsFor(detail).map(f => `places.${f}`).join(',');
+    const data = await this.post('places:searchText', body, mask, detail === 'pro' ? 'text_search_pro' : 'text_search_enterprise');
     return (data.places ?? []).map((p: any) => this.toSummary(p)).filter(Boolean) as PlaceSummary[];
   }
 
-  async details(placeId: string): Promise<PlaceSummary | null> {
+  async details(placeId: string, detail: LookupDetail = 'pro'): Promise<PlaceSummary | null> {
     this.requireKey();
-    const res = await fetch(`${PLACES_API}/places/${encodeURIComponent(placeId)}?languageCode=en`, {
-      headers: { 'X-Goog-Api-Key': this.apiKey, 'X-Goog-FieldMask': DETAIL_FIELD_MASK },
+    const url = `${PLACES_API}/places/${encodeURIComponent(placeId)}?languageCode=en`;
+    const init: RequestInit = {
+      headers: { 'X-Goog-Api-Key': this.apiKey, 'X-Goog-FieldMask': fieldsFor(detail).join(',') },
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    });
+    };
+    const sku: GoogleSku = detail === 'pro' ? 'place_details_pro' : 'place_details_enterprise';
+    const res = this.meter ? await this.meter.fetchGoogle(sku, url, init) : await fetch(url, init);
     if (res.status === 400 || res.status === 404) return null;
     if (!res.ok) throw new Error(`Place details failed (HTTP ${res.status})`);
     return this.toSummary(await res.json());
@@ -238,20 +248,23 @@ export class PlaceLookupService {
     const data = await this.post(
       'places:searchNearby',
       { locationRestriction: { circle: { center: location, radius: MAX_PIN_MATCH_METERS } }, maxResultCount: 5, rankPreference: 'DISTANCE', languageCode: 'en' },
-      SEARCH_FIELD_MASK
+      PRO_FIELDS.map(f => `places.${f}`).join(','),
+      'nearby_search_pro'
     );
     const places = (data.places ?? []).map((p: any) => this.toSummary(p)).filter(Boolean) as PlaceSummary[];
     return places.find(p => p.category !== 'AREA') ?? null;
   }
 
-  private async post(path: string, body: unknown, fieldMask: string): Promise<any> {
+  private async post(path: string, body: unknown, fieldMask: string, sku: GoogleSku): Promise<any> {
     this.requireKey();
-    const res = await fetch(`${PLACES_API}/${path}`, {
+    const url = `${PLACES_API}/${path}`;
+    const init: RequestInit = {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': this.apiKey, 'X-Goog-FieldMask': fieldMask },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-    });
+    };
+    const res = this.meter ? await this.meter.fetchGoogle(sku, url, init) : await fetch(url, init);
     if (!res.ok) throw new Error(`Places request failed (HTTP ${res.status}): ${(await res.text()).slice(0, 200)}`);
     return res.json();
   }

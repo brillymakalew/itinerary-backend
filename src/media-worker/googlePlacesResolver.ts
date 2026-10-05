@@ -1,6 +1,27 @@
 // Google Places Resolver (PRD §6.3, §9.3 Stage 7 & §15.2)
 
-import { ExtractedPlace, ExtractedEvidence } from './openaiExtractor';
+import { ExtractedPlace } from './openaiExtractor';
+import { JsonFileCache } from '../places/fileCache';
+import { UsageLimitError, UsageMeter } from '../usage/usageMeter';
+
+const SEARCH_URL = 'https://places.googleapis.com/v1/places:searchText';
+/**
+ * Pro fields only: enough to put a candidate on the map. Asking for ratings or price levels
+ * would bill the Enterprise SKU, which has a fifth of the free calls.
+ */
+const SEARCH_FIELD_MASK = 'places.id,places.displayName,places.formattedAddress,places.location,places.types,places.primaryType';
+const MAX_MATCHES = 4;
+const REQUEST_TIMEOUT_MS = 8_000;
+/** Videos about the same city keep naming the same places; their matches are reused for a month. */
+export const RESOLUTION_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+export interface ProviderMatch {
+  providerPlaceId: string;
+  name: string;
+  address?: string;
+  location: { latitude: number; longitude: number };
+  types: string[];
+}
 
 export interface ResolvedCandidate {
   id: string;
@@ -43,11 +64,11 @@ export interface ResolvedCandidate {
 }
 
 export class GooglePlacesResolver {
-  private apiKey: string;
-
-  constructor(apiKey: string) {
-    this.apiKey = apiKey;
-  }
+  constructor(
+    private readonly apiKey: string,
+    private readonly meter?: UsageMeter,
+    private readonly cache?: JsonFileCache<ProviderMatch[]>
+  ) {}
 
   /**
    * Resolve an extracted candidate against Google Places API (PRD §9.3 Stage 7)
@@ -60,34 +81,16 @@ export class GooglePlacesResolver {
       : destination;
     const query = `${candidate.raw_name} ${area}`;
 
-    let providerMatches: any[] = [];
+    let providerMatches: ProviderMatch[] = [];
 
     if (this.apiKey && !this.apiKey.includes('your-google-places')) {
       try {
-        const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&key=${this.apiKey}`;
-        const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
-        if (res.ok) {
-          const data = (await res.json()) as any;
-          if (Array.isArray(data.results)) {
-            providerMatches = data.results
-              .filter((r: any) => typeof r.geometry?.location?.lat === 'number')
-              .slice(0, 4)
-              .map((r: any) => ({
-                providerPlaceId: r.place_id,
-                name: r.name,
-                address: r.formatted_address,
-                location: {
-                  latitude: r.geometry.location.lat,
-                  longitude: r.geometry.location.lng
-                },
-                rating: r.rating,
-                priceLevel: r.price_level,
-                types: r.types || []
-              }));
-          }
-        }
+        providerMatches = await this.search(query);
       } catch (err) {
-        console.warn(`[GooglePlacesResolver] Text search error for "${query}":`, err);
+        // At the free-tier limit the whole import stops with that reason instead of saving
+        // places that can never be matched.
+        if (err instanceof UsageLimitError) throw err;
+        console.warn(`[GooglePlacesResolver] Text search error for "${query}":`, (err as any)?.message ?? err);
       }
     }
 
@@ -156,14 +159,41 @@ export class GooglePlacesResolver {
             name: topMatch.name,
             address: topMatch.address,
             location: topMatch.location,
-            rating: topMatch.rating,
-            priceLevel: topMatch.priceLevel,
             category: this.mapCategory(candidate.place_type),
             types: topMatch.types
           }
         : undefined,
       options: scoredOptions
     };
+  }
+
+  /** Places API (New) text search, answered from the cache when the same query was seen lately. */
+  private async search(query: string): Promise<ProviderMatch[]> {
+    const key = this.fold(query).replace(/\s+/g, ' ').trim();
+    const cached = this.cache?.get(key);
+    if (cached) return cached;
+
+    const init: RequestInit = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Goog-Api-Key': this.apiKey, 'X-Goog-FieldMask': SEARCH_FIELD_MASK },
+      body: JSON.stringify({ textQuery: query, maxResultCount: MAX_MATCHES, languageCode: 'en' }),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+    };
+    const res = this.meter ? await this.meter.fetchGoogle('text_search_pro', SEARCH_URL, init) : await fetch(SEARCH_URL, init);
+    if (!res.ok) throw new Error(`Place search failed (HTTP ${res.status}): ${(await res.text()).slice(0, 160)}`);
+    const data = (await res.json()) as { places?: any[] };
+    const matches: ProviderMatch[] = (data.places ?? [])
+      .filter(p => typeof p?.location?.latitude === 'number' && typeof p?.location?.longitude === 'number' && p.id)
+      .slice(0, MAX_MATCHES)
+      .map(p => ({
+        providerPlaceId: p.id,
+        name: p.displayName?.text ?? '',
+        address: p.formattedAddress,
+        location: { latitude: p.location.latitude, longitude: p.location.longitude },
+        types: Array.isArray(p.types) ? p.types : []
+      }));
+    this.cache?.set(key, matches);
+    return matches;
   }
 
   /** Accent-insensitive: "Hỏa Lò Prison" and "Hoa Lo Prison Relic" should be a strong match. */

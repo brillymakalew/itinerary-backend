@@ -53,6 +53,26 @@ Copy `.env.example` to `.env` and fill it in. The container refuses to start wit
 `API_TOKEN` of 16+ characters. The Android app needs the same value as `TRIPWEAVE_API_TOKEN` in
 `android/local.properties`, plus `TRIPWEAVE_API_URL=http://43.133.142.153:3030`.
 
+## Free-tier guard
+
+The server counts what it spends each month and shows it in the app (Trip tab, plus a warning
+banner at 50% and 80%). At **90%** it stops calling that API until the next month, so the last 10%
+of the free allowance is never touched.
+
+- **Google Maps:** every Places request is counted against its SKU's monthly free calls (5,000 for
+  Pro SKUs such as place search, 1,000 for Enterprise SKUs such as ratings/hours and photos). Photo
+  lists use Google's free "IDs only" lookup, ratings and hours are only fetched for the place
+  screen, place matches are reused for 30 days and photos are cached on disk for 30 days.
+- **OpenAI:** spend is estimated from the tokens and audio minutes each call reports, against
+  `OPENAI_MONTHLY_BUDGET_USD` (default 5).
+
+Counts live in `data/usage.json` (kept across rebuilds by the `vibi-data` volume) and start from
+zero on the first deploy; check the Google Cloud and OpenAI dashboards for anything spent before.
+`GET /api/usage` returns the current numbers.
+
+Imports are analyzed `MAX_CONCURRENT_IMPORTS` at a time (default 2); the rest wait in line and the
+app shows their place in it.
+
 ## Local development
 
 ```bash
