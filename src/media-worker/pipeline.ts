@@ -835,6 +835,22 @@ export class MediaProcessingPipeline {
     return dir;
   }
 
+  /**
+   * The app deleted this import: forget it, so sharing the same link again starts afresh, and
+   * free its stored video. An analysis still running for it finishes unseen (nothing is written).
+   */
+  removeJob(sourceId: string): boolean {
+    const job = this.jobs.get(sourceId);
+    this.runIds.set(sourceId, (this.runIds.get(sourceId) ?? 0) + 1);
+    clearTimeout(this.syncTimers.get(sourceId));
+    this.syncTimers.delete(sourceId);
+    this.jobs.delete(sourceId);
+    this.videos.remove(sourceId);
+    const upload = this.findUpload(sourceId);
+    if (upload) fs.rmSync(upload, { force: true });
+    return job !== undefined;
+  }
+
   // ---- Uploaded videos ---------------------------------------------------------------------
 
   private storeUpload(sourceId: string, tempFilePath: string, originalName: string): string {
@@ -893,7 +909,8 @@ export class MediaProcessingPipeline {
   }
 
   private async syncSource(job: SourceJob): Promise<void> {
-    if (!this.supabase) return;
+    // A deleted import is never written back.
+    if (!this.supabase || this.jobs.get(job.sourceId) !== job) return;
     const row: Record<string, unknown> = {
       id: job.sourceId,
       trip_id: job.tripId,
@@ -931,7 +948,7 @@ export class MediaProcessingPipeline {
   }
 
   private async syncCandidates(job: SourceJob): Promise<void> {
-    if (!this.supabase || job.candidates.length === 0) return;
+    if (!this.supabase || job.candidates.length === 0 || this.jobs.get(job.sourceId) !== job) return;
     // supabase-js reports failures in `error` instead of throwing, so each result is checked.
     const warn = (what: string, error: { message: string } | null) => {
       if (error) console.warn(`[Supabase Sync Notice] ${what}:`, error.message);

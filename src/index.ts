@@ -156,6 +156,14 @@ app.get('/api/sources/:id', (req, res) => {
   return res.json(publicJob(job));
 });
 
+// DELETE /api/sources/:id — the app deleted the import (for both travelers): forget it and its
+// stored video, so the same link can be shared again as new. Fine to repeat.
+app.delete('/api/sources/:id', (req, res) => {
+  if (!SOURCE_ID_PATTERN.test(req.params.id)) return badRequest(res, 'Unknown import');
+  pipeline.removeJob(req.params.id);
+  return res.status(204).end();
+});
+
 // GET /api/trips/:tripId/sources (Get all inbox sources for a trip)
 app.get('/api/trips/:tripId/sources', (req, res) => {
   return res.json(pipeline.getJobsForTrip(req.params.tripId).map(publicJob));

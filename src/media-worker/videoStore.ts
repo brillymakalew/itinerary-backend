@@ -90,6 +90,14 @@ export class VideoStore {
     }
   }
 
+  /** Forgets [sourceId]'s video and poster (its import was deleted). */
+  remove(sourceId: string) {
+    const file = this.find(sourceId);
+    if (file) fs.rmSync(file, { force: true });
+    fs.rmSync(path.join(this.dir, '.posters', `${VideoStore.safeId(sourceId)}.jpg`), { force: true });
+    this.failures.delete(sourceId);
+  }
+
   status(sourceId: string): VideoStatus {
     if (this.find(sourceId)) return { state: 'ready' };
     if (this.preparing.has(sourceId)) return { state: 'preparing' };

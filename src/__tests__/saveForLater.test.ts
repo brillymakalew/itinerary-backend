@@ -66,6 +66,16 @@ describe('links saved for later', () => {
     expect(again.status).toBe('saved');
   });
 
+  it('starts afresh when a deleted link is shared again', () => {
+    const p = pipeline();
+    const first = p.startImportJob('trip_t', link, { analyze: false });
+    expect(p.removeJob(first.sourceId)).toBe(true);
+    expect(p.getJob(first.sourceId)).toBeUndefined();
+    const again = p.startImportJob('trip_t', link, { analyze: false });
+    expect(again.sourceId).not.toBe(first.sourceId);
+    expect(p.removeJob('src_unknown_1234')).toBe(false);
+  });
+
   it('keeps the id the app sends back after a server restart', () => {
     expect(pipeline().startImportJob('trip_t', link, { analyze: false, sourceId: 'src_1791160299129_v5yn' }).sourceId)
       .toBe('src_1791160299129_v5yn');
